@@ -123,6 +123,14 @@ func (w *Worker) CollectStats() {
 	fmt.Println("I will collect stats")
 }
 
+func (w *Worker) GetTasks() []*task.Task {
+	tasks := make([]*task.Task, 0, len(w.Db))
+	for _, task := range w.Db {
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
 func finishTask(t *task.Task, w *Worker) {
 	// Mark the task as completed
 	t.State = task.Completed
