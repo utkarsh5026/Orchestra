@@ -10,4 +10,13 @@ type Node struct {
 	DiskAllocated   int
 	Role            string
 	TaskCount       int
+	Api             string
+}
+
+func NewNode(name string, api string, role string) *Node {
+	return &Node{
+		Name: name,
+		Api:  api,
+		Role: role,
+	}
 }

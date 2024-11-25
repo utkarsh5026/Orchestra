@@ -41,3 +41,13 @@ type Scheduler interface {
 	//   - *node.Node: The selected node to run the task, or nil if no suitable node found
 	Pick(scores map[string]float64, candidates []*node.Node) *node.Node
 }
+
+type SchedulerType uint
+
+const (
+	RoundRobinScheduler SchedulerType = iota
+)
+
+func NewScheduler(st SchedulerType) Scheduler {
+	return &RoundRobin{}
+}

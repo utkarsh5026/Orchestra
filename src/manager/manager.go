@@ -8,6 +8,9 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/utkarsh5026/Orchestra/node"
+	"github.com/utkarsh5026/Orchestra/scheduler"
+
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 	"github.com/utkarsh5026/Orchestra/task"
@@ -22,23 +25,30 @@ type Manager struct {
 	Workers       []string
 	WorkerTaskMap map[string][]uuid.UUID
 	TaskWorkerMap map[uuid.UUID]string
+	Scheduler     scheduler.Scheduler
+	WorkerNodes   []*node.Node
 }
 
 // NewManager creates and initializes a new Manager instance.
 //
 // Parameters:
 //   - workers: A slice of worker addresses/endpoints that this manager will coordinate
+//   - st: The type of scheduler to use
 //
 // Returns:
 //   - *Manager: A new Manager instance initialized with:
-func NewManager(workers []string) *Manager {
+func NewManager(workers []string, st scheduler.SchedulerType) *Manager {
 	taskStore := make(map[uuid.UUID]*task.Task)
 	eventStore := make(map[uuid.UUID]*task.Event)
 	workerTaskMap := make(map[string][]uuid.UUID)
 	taskWorkerMap := make(map[uuid.UUID]string)
 
+	var workerNodes []*node.Node
 	for _, w := range workers {
 		workerTaskMap[w] = []uuid.UUID{}
+		api := fmt.Sprintf("http://%s/tasks", w)
+		n := node.NewNode(w, api, "worker")
+		workerNodes = append(workerNodes, n)
 	}
 
 	return &Manager{
@@ -48,6 +58,8 @@ func NewManager(workers []string) *Manager {
 		TaskWorkerMap: taskWorkerMap,
 		Workers:       workers,
 		Pending:       *queue.New(),
+		WorkerNodes:   workerNodes,
+		Scheduler:     scheduler.NewScheduler(st),
 	}
 }
 
