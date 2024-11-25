@@ -76,14 +76,24 @@ func (w *Worker) StopTask(t *task.Task) task.DockerResult {
 	return result
 }
 
-func (w *Worker) AddTask(t *task.Task) {
-	w.Queue.Enqueue(t)
-}
-
-// RunTask dequeues and processes the next task from the worker's queue
+// RunTask processes the next task in the worker's queue.
+//
+// The function will:
+// 1. Dequeue the next task from the worker's queue
+// 2. Check if the task exists in the worker's database
+// 3. Validate and execute the requested state transition
+//
+// State transitions:
+//   - Scheduled -> Running: Starts the task's container via StartTask()
+//   - Running -> Completed: Stops the task's container via StopTask()
 //
 // Returns:
-//   - task.DockerResult containing any errors that occurred during task execution
+//   - task.DockerResult containing:
+//   - ContainerId of the started/stopped container
+//   - Error if:
+//   - Queue is empty
+//   - Invalid state transition requested
+//   - Docker operations fail
 func (w *Worker) RunTask() task.DockerResult {
 	t := w.Queue.Dequeue()
 	if t == nil {
@@ -123,6 +133,10 @@ func (w *Worker) CollectStats() {
 	fmt.Println("I will collect stats")
 }
 
+// GetTasks returns a slice of all tasks currently stored in the worker's database.
+//
+// Returns:
+//   - []*task.Task: A slice containing pointers to all Task objects in the worker's database
 func (w *Worker) GetTasks() []*task.Task {
 	tasks := make([]*task.Task, 0, len(w.Db))
 	for _, t := range w.Db {
@@ -131,6 +145,15 @@ func (w *Worker) GetTasks() []*task.Task {
 	return tasks
 }
 
+// RunTasks continuously processes tasks from the worker's queue in an infinite loop.
+//
+// The function will:
+// 1. Check if there are any tasks in the queue
+// 2. If tasks exist, run them one by one
+// 3. Sleep for 10 seconds between iterations
+//
+// This function runs indefinitely and should be started in a separate goroutine.
+// It provides the main task processing loop for the worker.
 func (w *Worker) RunTasks() {
 	for {
 		if w.Queue.Len() > 0 {
@@ -145,6 +168,27 @@ func (w *Worker) RunTasks() {
 		log.Println("Sleeping for 10 seconds.")
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// InspectTask inspects a Docker container associated with a task.
+//
+// Parameters:
+//   - t: The task.Task object containing the container ID to inspect
+//
+// Returns:
+//   - task.DockerInspectResponse containing container inspection details or error
+func (w *Worker) InspectTask(t task.Task) task.DockerInspectResponse {
+	config := task.NewConfig(&t)
+	d, err := task.NewDocker(*config)
+	if err != nil {
+		log.Printf("Error creating Docker: %v\n", err)
+		return task.DockerInspectResponse{Error: err}
+	}
+	return d.Inspect(t.ContainerID)
+}
+
+func (w *Worker) AddTask(t *task.Task) {
+	w.Queue.Enqueue(t)
 }
 
 func finishTask(t *task.Task, w *Worker) {

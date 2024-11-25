@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"github.com/docker/docker/api/types"
 	"io"
 	"log"
 	"math"
@@ -25,13 +26,18 @@ type DockerResult struct {
 	Result      string
 }
 
+type DockerInspectResponse struct {
+	Error   error
+	Inspect types.ContainerJSON
+}
+
 func NewDocker(config Config) (*Docker, error) {
-	client, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatalf("Error creating Docker client: %v\n", err)
+		log.Fatalf("Error creating Docker c: %v\n", err)
 		return nil, err
 	}
-	return &Docker{Config: config, Client: client}, nil
+	return &Docker{Config: config, Client: c}, nil
 }
 
 func (d *Docker) Run() DockerResult {
@@ -130,4 +136,14 @@ func (d *Docker) Stop(cid string) DockerResult {
 	return DockerResult{ContainerId: cid,
 		Action: "stop",
 		Result: "success"}
+}
+
+func (d *Docker) Inspect(cid string) DockerInspectResponse {
+	ctx := context.Background()
+	inspect, err := d.Client.ContainerInspect(ctx, cid)
+	if err != nil {
+		log.Printf("Error inspecting container %s: %v\n", cid, err)
+		return DockerInspectResponse{Error: err}
+	}
+	return DockerInspectResponse{Inspect: inspect}
 }
