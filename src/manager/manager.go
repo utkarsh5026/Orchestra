@@ -243,3 +243,11 @@ func (m *Manager) getTasksFromWorker(workerName string) ([]*task.Task, error) {
 func (m *Manager) AddTask(te task.Event) {
 	m.Pending.Enqueue(te)
 }
+
+func (m *Manager) GetTasks() []*task.Task {
+	tasks := make([]*task.Task, 0, len(m.TaskStore))
+	for _, t := range m.TaskStore {
+		tasks = append(tasks, t)
+	}
+	return tasks
+}
