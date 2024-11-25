@@ -5,6 +5,9 @@ import (
 	"log"
 	"time"
 
+	"github.com/utkarsh5026/Orchestra/store"
+	"github.com/utkarsh5026/Orchestra/utils"
+
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 	"github.com/utkarsh5026/Orchestra/task"
@@ -13,8 +16,17 @@ import (
 type Worker struct {
 	Name      string
 	Queue     queue.Queue
-	Db        map[uuid.UUID]*task.Task
+	Db        store.Store[uuid.UUID, *task.Task]
 	TaskCount int
+}
+
+func NewWorker(name string, dt store.Type) *Worker {
+	w := Worker{
+		Name:  name,
+		Queue: *queue.New(),
+	}
+	w.Db = store.NewStore[uuid.UUID, *task.Task](dt)
+	return &w
 }
 
 // StartTask initializes and runs a new task in a Docker container
@@ -31,7 +43,7 @@ func (w *Worker) StartTask(t *task.Task) task.DockerResult {
 	if err != nil {
 		log.Printf("Error creating Docker: %v\n", err)
 		t.State = task.Failed
-		w.Db[t.ID] = t
+		utils.UpdateStore(w.Db, t.ID, t)
 		return task.DockerResult{Error: err}
 	}
 
@@ -40,13 +52,13 @@ func (w *Worker) StartTask(t *task.Task) task.DockerResult {
 	if result.Error != nil {
 		log.Printf("Err running task %v: %v\n", t.ID, result.Error)
 		t.State = task.Failed
-		w.Db[t.ID] = t
+		utils.UpdateStore(w.Db, t.ID, t)
 		return result
 	}
 
 	t.ContainerID = result.ContainerId
 	t.State = task.Running
-	w.Db[t.ID] = t
+	utils.UpdateStore(w.Db, t.ID, t)
 	return result
 }
 
@@ -61,7 +73,7 @@ func (w *Worker) StopTask(t *task.Task) task.DockerResult {
 	d, err := task.NewDocker(*config)
 	if err != nil {
 		log.Printf("Error creating Docker: %v\n", err)
-		finishTask(t, w)
+		w.finishTask(t)
 		return task.DockerResult{Error: err}
 	}
 
@@ -70,18 +82,13 @@ func (w *Worker) StopTask(t *task.Task) task.DockerResult {
 		log.Printf("Error stopping container %s: %v\n", t.ContainerID, result.Error)
 	}
 
-	finishTask(t, w)
+	w.finishTask(t)
 	log.Printf("Stopped and removed container %v for task %v\n",
 		t.ContainerID, t.ID)
 	return result
 }
 
 // RunTask processes the next task in the worker's queue.
-//
-// The function will:
-// 1. Dequeue the next task from the worker's queue
-// 2. Check if the task exists in the worker's database
-// 3. Validate and execute the requested state transition
 //
 // State transitions:
 //   - Scheduled -> Running: Starts the task's container via StartTask()
@@ -102,11 +109,15 @@ func (w *Worker) RunTask() task.DockerResult {
 	}
 
 	taskToRun := t.(*task.Task)
-	taskPersisted := w.Db[taskToRun.ID]
+	taskPersisted, err := w.Db.Get(taskToRun.ID)
+	if err != nil {
+		log.Printf("Error getting task %s: %v\n", taskToRun.ID, err)
+		return task.DockerResult{Error: err}
+	}
 
 	if taskPersisted == nil {
 		taskPersisted = taskToRun
-		w.Db[taskToRun.ID] = taskPersisted
+		utils.UpdateStore(w.Db, taskToRun.ID, taskPersisted)
 	}
 
 	var result task.DockerResult
@@ -129,28 +140,24 @@ func (w *Worker) RunTask() task.DockerResult {
 	return result
 }
 
-func (w *Worker) CollectStats() {
-	fmt.Println("I will collect stats")
-}
-
 // GetTasks returns a slice of all tasks currently stored in the worker's database.
 //
 // Returns:
 //   - []*task.Task: A slice containing pointers to all Task objects in the worker's database
-func (w *Worker) GetTasks() []*task.Task {
-	tasks := make([]*task.Task, 0, len(w.Db))
-	for _, t := range w.Db {
+//   - error: Any error that occurred while retrieving tasks from the database
+func (w *Worker) GetTasks() ([]*task.Task, error) {
+	ts, err := w.Db.List()
+	if err != nil {
+		return nil, err
+	}
+	tasks := make([]*task.Task, 0, len(ts))
+	for _, t := range ts {
 		tasks = append(tasks, t)
 	}
-	return tasks
+	return tasks, nil
 }
 
 // RunTasks continuously processes tasks from the worker's queue in an infinite loop.
-//
-// The function will:
-// 1. Check if there are any tasks in the queue
-// 2. If tasks exist, run them one by one
-// 3. Sleep for 10 seconds between iterations
 //
 // This function runs indefinitely and should be started in a separate goroutine.
 // It provides the main task processing loop for the worker.
@@ -191,9 +198,54 @@ func (w *Worker) AddTask(t *task.Task) {
 	w.Queue.Enqueue(t)
 }
 
-func finishTask(t *task.Task, w *Worker) {
-	// Mark the task as completed
+// UpdateTasks continuously monitors and updates task status at specified intervals.
+//
+// Parameters:
+//   - d: The duration to wait between status checks
+//
+// This function runs indefinitely and should be started in a separate goroutine.
+func (w *Worker) UpdateTasks(d time.Duration) {
+	for {
+		log.Println("Checking status of tasks")
+		w.updateTasks()
+		log.Println("Task updates completed")
+		log.Printf("Sleeping for %v seconds\n", d)
+		time.Sleep(d)
+	}
+}
+
+// updateTasks checks all running tasks and updates their state based on container status.
+//
+// Any errors encountered during listing tasks, inspecting containers, or updating
+// task state are logged but do not stop processing of other tasks.
+func (w *Worker) updateTasks() {
+	tasks, err := w.Db.List()
+	if err != nil {
+		log.Printf("Error listing tasks: %v\n", err)
+		return
+	}
+
+	for _, t := range tasks {
+		if t.State != task.Running {
+			continue
+		}
+
+		inspect := w.InspectTask(*t)
+		if inspect.Error != nil {
+			log.Printf("Error inspecting container %s: %v\n", t.ContainerID, inspect.Error)
+			continue
+		}
+
+		if inspect.Inspect.State.Status == "exited" {
+			log.Printf("Container %s exited with status %d\n", t.ContainerID, inspect.Inspect.State.ExitCode)
+			t.State = task.Failed
+			utils.UpdateStore(w.Db, t.ID, t)
+		}
+	}
+}
+
+func (w *Worker) finishTask(t *task.Task) error {
 	t.State = task.Completed
 	t.EndTime = time.Now().UTC()
-	w.Db[t.ID] = t
+	return w.Db.Put(t.ID, t)
 }
