@@ -2,11 +2,12 @@ package task
 
 import (
 	"context"
-	"github.com/docker/docker/api/types"
 	"io"
 	"log"
 	"math"
 	"os"
+
+	"github.com/docker/docker/api/types"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -146,4 +147,16 @@ func (d *Docker) Inspect(cid string) DockerInspectResponse {
 		return DockerInspectResponse{Error: err}
 	}
 	return DockerInspectResponse{Inspect: inspect}
+}
+
+func (d *Docker) Remove(cid string) DockerResult {
+	ctx := context.Background()
+	err := d.Client.ContainerRemove(ctx, cid, container.RemoveOptions{})
+
+	if err != nil {
+		log.Printf("Error removing container: %v\n", err)
+		return DockerResult{Error: err}
+	}
+
+	return DockerResult{ContainerId: cid, Action: "remove", Result: "success"}
 }
