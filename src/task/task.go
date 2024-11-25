@@ -6,23 +6,15 @@ import (
 	"time"
 )
 
-type State uint
-
-const (
-	Pending State = iota
-	Scheduled
-	Running
-	Completed
-	Failed
-)
-
 type Task struct {
 	ID            uuid.UUID
 	State         State
+	ContainerID   string
 	Name          string
 	Image         string
-	Memory        int
-	Disk          int
+	Memory        int64
+	Disk          int64
+	Cpu           float64
 	ExposedPorts  nat.PortSet
 	RestartPolicy string
 	PortBindings  map[string]string
@@ -48,4 +40,16 @@ type Config struct {
 
 type Runtime struct {
 	ContainerId string
+}
+
+func NewConfig(t *Task) *Config {
+	return &Config{
+		Name:          t.Name,
+		ExposedPorts:  t.ExposedPorts,
+		Image:         t.Image,
+		Cpu:           t.Cpu,
+		Memory:        t.Memory,
+		Disk:          t.Disk,
+		RestartPolicy: t.RestartPolicy,
+	}
 }

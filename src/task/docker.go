@@ -25,6 +25,15 @@ type DockerResult struct {
 	Result      string
 }
 
+func NewDocker(config Config) (*Docker, error) {
+	client, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatalf("Error creating Docker client: %v\n", err)
+		return nil, err
+	}
+	return &Docker{Config: config, Client: client}, nil
+}
+
 func (d *Docker) Run() DockerResult {
 	ctx := context.Background()
 	img := d.Config.Image
