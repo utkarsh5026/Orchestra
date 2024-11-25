@@ -125,10 +125,26 @@ func (w *Worker) CollectStats() {
 
 func (w *Worker) GetTasks() []*task.Task {
 	tasks := make([]*task.Task, 0, len(w.Db))
-	for _, task := range w.Db {
-		tasks = append(tasks, task)
+	for _, t := range w.Db {
+		tasks = append(tasks, t)
 	}
 	return tasks
+}
+
+func (w *Worker) RunTasks() {
+	for {
+		if w.Queue.Len() > 0 {
+			result := w.RunTask()
+			if result.Error != nil {
+				log.Printf("Error running task: %v\n", result.Error)
+			}
+		} else {
+			log.Println("No tasks to process currently.")
+		}
+
+		log.Println("Sleeping for 10 seconds.")
+		time.Sleep(10 * time.Second)
+	}
 }
 
 func finishTask(t *task.Task, w *Worker) {
