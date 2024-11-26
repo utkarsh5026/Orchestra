@@ -2,7 +2,7 @@ package worker
 
 import (
 	"encoding/json"
-	"fmt"
+	"github.com/utkarsh5026/Orchestra/handler"
 	"log"
 	"net/http"
 
@@ -10,11 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/utkarsh5026/Orchestra/task"
 )
-
-type ErrorResponse struct {
-	HTTPStatusCode int
-	Message        string
-}
 
 // StartTaskHandler handles HTTP POST requests to start a new task
 // It decodes the task event from the request body and adds the task to the worker's queue
@@ -26,7 +21,10 @@ type ErrorResponse struct {
 // The handler expects a JSON request body containing a task.Event
 // Returns HTTP 400 if request body is invalid
 // Returns HTTP 200 with the queued task on success
-func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Api) StartTaskHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 
@@ -34,20 +32,15 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 	err := d.Decode(&taskEvent)
 
 	if err != nil {
-		msg := fmt.Sprintf("Error decoding the request body: %v", err)
-		log.Println(msg)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			HTTPStatusCode: http.StatusBadRequest,
-			Message:        msg,
-		})
+		resErr := handler.Err(http.StatusBadRequest, "Invalid request body", err)
+		handler.SendErr(w, resErr)
 		return
 	}
 
 	a.Worker.AddTask(&taskEvent.Task)
 	log.Printf("Task added to the queue: %s", taskEvent.Task.ID)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(taskEvent.Task)
+	_ = json.NewEncoder(w).Encode(taskEvent.Task)
 }
 
 // GetTasksHandler handles HTTP GET requests to retrieve all tasks from the worker
@@ -59,17 +52,23 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Returns HTTP 200 with JSON array of tasks on success
 // Returns HTTP 500 if there is an error encoding the response
-func (a *Api) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Api) GetTasksHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ts, err := a.Worker.GetTasks()
+	if err != nil {
+		resErr := handler.Err(http.StatusInternalServerError, "Error getting tasks", err)
+		handler.SendErr(w, resErr)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	err := json.NewEncoder(w).Encode(a.Worker.GetTasks())
+	err = json.NewEncoder(w).Encode(ts)
 	if err != nil {
 		log.Printf("Error encoding tasks: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			HTTPStatusCode: http.StatusInternalServerError,
-			Message:        "Error encoding tasks",
-		})
+		resErr := handler.Err(http.StatusInternalServerError, "Error encoding tasks", err)
+		handler.SendErr(w, resErr)
 	}
 }
 
@@ -84,38 +83,39 @@ func (a *Api) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 // Returns HTTP 400 if task ID is missing or invalid
 // Returns HTTP 404 if task is not found
 // Returns HTTP 204 on successful queueing of the stop request
-func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Api) StopTaskHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	taskId := chi.URLParam(r, "taskID")
 	if taskId == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			HTTPStatusCode: http.StatusBadRequest,
-			Message:        "Task ID is required",
-		})
+		resErr := handler.Err(http.StatusBadRequest, "Task ID is required", nil)
+		handler.SendErr(w, resErr)
 		return
 	}
 
 	tID, err := uuid.Parse(taskId)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			HTTPStatusCode: http.StatusBadRequest,
-			Message:        "Invalid task ID",
-		})
+		resErr := handler.Err(http.StatusBadRequest, "Invalid task ID", err)
+		handler.SendErr(w, resErr)
+		return
 	}
 
-	_, ok := a.Worker.Db[tID]
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			HTTPStatusCode: http.StatusNotFound,
-			Message:        "Task not found",
-		})
+	t, err := a.Worker.Db.Get(tID)
+	if err != nil {
+		resErr := handler.Err(http.StatusNotFound, "Task not found", err)
+		handler.SendErr(w, resErr)
 	}
 
-	taskToStop := *a.Worker.Db[tID]
+	taskToStop, err := a.Worker.Db.Get(t.ID)
+	if err != nil {
+		resErr := handler.Err(http.StatusNotFound, "Task not found", err)
+		handler.SendErr(w, resErr)
+		return
+	}
+
 	taskToStop.State = task.Completed
-	a.Worker.AddTask(&taskToStop)
+	a.Worker.AddTask(taskToStop)
 
 	log.Printf("Adding task %v to stop the container %v\n", taskToStop.ID, taskToStop.ContainerID)
 	w.WriteHeader(http.StatusNoContent)
