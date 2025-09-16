@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
+
+	"github.com/utkarsh5026/Orchestra/store"
 
 	"github.com/utkarsh5026/Orchestra/node"
 	"github.com/utkarsh5026/Orchestra/scheduler"
@@ -20,8 +23,8 @@ import (
 type Manager struct {
 	LastWorkerIdx int
 	Pending       queue.Queue
-	TaskStore     map[uuid.UUID]*task.Task
-	EventStore    map[uuid.UUID]*task.Event
+	TaskStore     store.Store[string, *task.Task]
+	EventStore    store.Store[string, *task.Event]
 	Workers       []string
 	WorkerTaskMap map[string][]uuid.UUID
 	TaskWorkerMap map[uuid.UUID]string
@@ -34,28 +37,29 @@ type Manager struct {
 // Parameters:
 //   - workers: A slice of worker addresses/endpoints that this manager will coordinate
 //   - st: The type of scheduler to use
+//   - storeType: The type of store to use for task and event data
 //
 // Returns:
 //   - *Manager: A new Manager instance initialized with:
-func NewManager(workers []string, st scheduler.SchedulerType) *Manager {
-	taskStore := make(map[uuid.UUID]*task.Task)
-	eventStore := make(map[uuid.UUID]*task.Event)
-	workerTaskMap := make(map[string][]uuid.UUID)
-	taskWorkerMap := make(map[uuid.UUID]string)
+func NewManager(workers []string, st scheduler.Type, storeType store.Type) *Manager {
+	ts := store.NewStore[string, *task.Task](storeType)
+	es := store.NewStore[string, *task.Event](storeType)
+	wt := make(map[string][]uuid.UUID)
+	tw := make(map[uuid.UUID]string)
 
 	var workerNodes []*node.Node
 	for _, w := range workers {
-		workerTaskMap[w] = []uuid.UUID{}
+		wt[w] = []uuid.UUID{}
 		api := fmt.Sprintf("http://%s/tasks", w)
 		n := node.NewNode(w, api, "worker")
 		workerNodes = append(workerNodes, n)
 	}
 
 	return &Manager{
-		TaskStore:     taskStore,
-		EventStore:    eventStore,
-		WorkerTaskMap: workerTaskMap,
-		TaskWorkerMap: taskWorkerMap,
+		TaskStore:     ts,
+		EventStore:    es,
+		WorkerTaskMap: wt,
+		TaskWorkerMap: tw,
 		Workers:       workers,
 		Pending:       *queue.New(),
 		WorkerNodes:   workerNodes,
@@ -65,27 +69,25 @@ func NewManager(workers []string, st scheduler.SchedulerType) *Manager {
 
 // SelectWorker returns the next available worker using round-robin scheduling.
 //
-// It maintains the LastWorkerIdx to track which worker was last selected and
-// cycles through the list of workers sequentially. When it reaches the end,
-// it wraps back to the beginning.
+// Parameters:
+//   - t: The task to select a worker for
 //
 // Returns:
-//   - The address/endpoint of the selected worker
+//   - *node.Node: The selected worker node
 //   - An error if no workers are available
-func (m *Manager) SelectWorker() (string, error) {
-	if len(m.Workers) == 0 {
-		return "", errors.New("no workers available")
+func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
+	candidates := m.Scheduler.SelectCandidates(t, m.WorkerNodes)
+	if candidates == nil {
+		return nil, fmt.Errorf("No candidates found to satisfy task requirements for the task %v\n", t.ID)
 	}
 
-	var newWorkerIdx int
-	if m.LastWorkerIdx < len(m.Workers) {
-		newWorkerIdx = m.LastWorkerIdx + 1
-		m.LastWorkerIdx++
-	} else {
-		newWorkerIdx = 0
-		m.LastWorkerIdx = 0
+	scores := m.Scheduler.Score(t, candidates)
+	if scores == nil {
+		return nil, fmt.Errorf("No scores found for the task %v\n", t.ID)
 	}
-	return m.Workers[newWorkerIdx], nil
+
+	selected := m.Scheduler.Pick(scores, candidates)
+	return selected, nil
 }
 
 // UpdateTasks polls all workers for their current tasks and updates the manager's task store
@@ -109,12 +111,14 @@ func (m *Manager) UpdateTasks() {
 		}
 
 		for _, t := range tasks {
-			_, ok := m.TaskStore[t.ID]
-			if !ok {
+			old, err := m.TaskStore.Get(t.ID.String())
+			if err != nil {
 				log.Printf("Task %s not found in task store", t.ID)
 				continue
 			}
-			m.updateTask(t)
+			if err := m.updateTask(old, t); err != nil {
+				log.Printf("Error updating task %s: %s", t.ID, err)
+			}
 		}
 	}
 }
@@ -124,39 +128,202 @@ func (m *Manager) UpdateTasks() {
 // Returns:
 //   - error if there are no pending tasks, no available workers,
 //     task marshaling fails, or sending to worker fails
-//
-// The function will:
-// 1. Check for pending tasks and available workers
-// 2. Select a worker using round-robin scheduling
-// 3. Dequeue the next task event and update tracking maps
-// 4. Set task state to Scheduled
-// 5. Marshal and send the task to the selected worker
 func (m *Manager) SendWork() error {
 	if m.Pending.Len() == 0 {
 		return errors.New("no pending tasks")
 	}
 
-	worker, err := m.SelectWorker()
+	e := m.Pending.Dequeue().(task.Event)
+	err := m.EventStore.Put(e.ID.String(), &e)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to persist task event: %w", err)
+	}
+	log.Printf("Sending task %s to worker\n", e.Task.ID)
+
+	taskID := e.Task.ID
+	taskWorker, ok := m.TaskWorkerMap[taskID]
+	if ok {
+		pt, err := m.TaskStore.Get(taskID.String())
+		if err != nil {
+			return fmt.Errorf("failed to get persisted task %s: %w", taskID, err)
+		}
+
+		if e.State == task.Completed && pt.State.CanTransitionTo(e.State) {
+			return m.stopTask(taskWorker, taskID.String())
+		}
+		return fmt.Errorf("invalid request: existing task %s is in state %v and cannot transition to the completed state", pt.ID.String(), pt.State)
+	}
+
+	w, err := m.SelectWorker(e.Task)
+	if err != nil {
+		return fmt.Errorf("failed to select worker for task %s: %w", taskID, err)
 	}
 
 	taskEvent := m.Pending.Dequeue().(task.Event)
 	t := taskEvent.Task
-
-	log.Printf("Sending task %s to worker %s", t.ID, worker)
-	m.EventStore[taskEvent.ID] = &taskEvent
-	m.TaskWorkerMap[t.ID] = worker
-	m.WorkerTaskMap[worker] = append(m.WorkerTaskMap[worker], t.ID)
+	workerName := w.Name
+	m.TaskWorkerMap[t.ID] = workerName
+	m.WorkerTaskMap[workerName] = append(m.WorkerTaskMap[workerName], t.ID)
 
 	t.State = task.Scheduled
-	m.TaskStore[t.ID] = &t
+	m.TaskStore.Put(t.ID.String(), &t)
 
 	data, err := json.Marshal(taskEvent)
 	if err != nil {
 		return fmt.Errorf("failed to marshal task event: %w", err)
 	}
-	return m.sendTaskToWorker(worker, data)
+	return m.sendTaskToWorker(workerName, data)
+}
+
+// updateTask updates the manager's task store with the latest task state and metadata
+//
+// Parameters:
+//   - old: Pointer to the task.Task object to update
+//   - new: Pointer to the task.Task object with the updated state and metadata
+//
+// Returns:
+//   - error if the task store update fails
+func (m *Manager) updateTask(old *task.Task, new *task.Task) error {
+	if old.State != new.State {
+		old.State = new.State
+	}
+	old.StartTime = new.StartTime
+	old.EndTime = new.EndTime
+	old.State = new.State
+	old.ContainerID = new.ContainerID
+	return m.TaskStore.Put(old.ID.String(), old)
+}
+
+// getTasksFromWorker retrieves the current tasks from a worker via HTTP GET request
+//
+// Parameters:
+//   - workerName: The name/address of the worker to get tasks from
+//
+// Returns:
+//   - []*task.Task: Array of tasks currently running on the worker
+//   - error: If the request fails, worker returns non-200 status, or response cannot be decoded
+func (m *Manager) getTasksFromWorker(workerName string) ([]*task.Task, error) {
+	url := fmt.Sprintf("http://%s/tasks", workerName)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tasks from worker %s: %w", workerName, err)
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error getting tasks from worker %s: %s", workerName, resp.Status)
+	}
+
+	var tasks []*task.Task
+	err = json.NewDecoder(resp.Body).Decode(&tasks)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode tasks from worker %s: %w", workerName, err)
+	}
+
+	return tasks, nil
+}
+
+func (m *Manager) AddTask(te task.Event) {
+	m.Pending.Enqueue(te)
+}
+
+// GetTasks returns a slice of all tasks currently stored in the manager's task store.
+//
+// Returns:
+//   - []*task.Task: A slice containing pointers to all Task objects in the manager's task store
+func (m *Manager) GetTasks() ([]*task.Task, error) {
+	n, err := m.TaskStore.Count()
+	if err != nil {
+		return nil, err
+	}
+
+	ts, err := m.TaskStore.List()
+	if err != nil {
+		return nil, err
+	}
+	tasks := make([]*task.Task, 0, n)
+	for _, t := range ts {
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
+
+func (m *Manager) LoopTasks() {
+	for {
+		log.Println("Processing any tasks in the queue")
+		err := m.SendWork()
+
+		if err != nil {
+			err = fmt.Errorf("error processing tasks: %w", err)
+			log.Println(err)
+		}
+
+		log.Println("Sleeping for 10 seconds")
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// stopTask sends a request to stop a specific task on a worker node
+//
+// Parameters:
+//   - workerName: The name/address of the worker running the task
+//   - taskID: The ID of the task to stop
+//
+// Returns:
+//   - error: If the request fails, worker returns non-204 status, or other errors occur
+func (m *Manager) stopTask(workerName string, taskID string) error {
+	var httpClient http.Client
+	url := fmt.Sprintf("http://%s/tasks/%s", workerName, taskID)
+
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request to stop task %s on worker %s: %w", taskID, workerName, err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to stop task %s on worker %s: %w", taskID, workerName, err)
+	}
+
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("failed to stop task %s on worker %s: %s", taskID, workerName, resp.Status)
+	}
+
+	log.Printf("Task %s stopped on worker %s", taskID, workerName)
+	return nil
+}
+
+// restartTask attempts to restart a task on its assigned worker
+//
+// Parameters:
+//   - t: The task to restart
+//
+// Returns:
+//   - error: If the task is not found in the worker map, task state update fails,
+//     event marshaling fails, or sending to worker fails
+func (m *Manager) restartTask(t *task.Task) error {
+	w, ok := m.TaskWorkerMap[t.ID]
+	if !ok {
+		return fmt.Errorf("task %s not found", t.ID)
+	}
+
+	t.State = task.Scheduled
+	err := m.TaskStore.Put(t.ID.String(), t)
+	if err != nil {
+		return fmt.Errorf("failed to update task %s: %w", t.ID, err)
+	}
+
+	te := task.Event{
+		ID:        uuid.New(),
+		State:     task.Running,
+		Timestamp: time.Now(),
+		Task:      *t,
+	}
+	data, err := json.Marshal(te)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task event: %w", err)
+	}
+	return m.sendTaskToWorker(w, data)
 }
 
 // sendTaskToWorker sends a task to a worker via HTTP POST request
@@ -168,12 +335,6 @@ func (m *Manager) SendWork() error {
 // Returns:
 //   - error if the request fails, the worker returns an error response,
 //     or the response cannot be decoded
-//
-// The function will:
-// 1. Send the task data to the worker's /tasks endpoint
-// 2. Re-queue the task if the request fails
-// 3. Parse and return any error response from the worker
-// 4. Decode and log the successful task response
 func (m *Manager) sendTaskToWorker(workerName string, data []byte) error {
 	url := fmt.Sprintf("http://%s/tasks", workerName)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
@@ -200,66 +361,5 @@ func (m *Manager) sendTaskToWorker(workerName string, data []byte) error {
 	}
 
 	log.Printf("Task %s sent to worker %s", t.ID, workerName)
-	log.Printf("%#v\n", t)
 	return nil
-}
-
-// updateTask updates the manager's task store with the latest task state and metadata
-//
-// Parameters:
-//   - t: Pointer to the task.Task object to update
-//
-// The function will:
-// 1. Update the task's state and metadata in the manager's task store
-func (m *Manager) updateTask(t *task.Task) {
-	m.TaskStore[t.ID].StartTime = t.StartTime
-	m.TaskStore[t.ID].EndTime = t.EndTime
-	m.TaskStore[t.ID].State = t.State
-	m.TaskStore[t.ID].ContainerID = t.ContainerID
-}
-
-// getTasksFromWorker retrieves the current tasks from a worker via HTTP GET request
-//
-// Parameters:
-//   - workerName: The name/address of the worker to get tasks from
-//
-// Returns:
-//   - []*task.Task: Array of tasks currently running on the worker
-//   - error: If the request fails, worker returns non-200 status, or response cannot be decoded
-//
-// The function will:
-// 1. Make an HTTP GET request to the worker's /tasks endpoint
-// 2. Check for successful response status
-// 3. Decode the JSON response into task objects
-func (m *Manager) getTasksFromWorker(workerName string) ([]*task.Task, error) {
-	url := fmt.Sprintf("http://%s/tasks", workerName)
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks from worker %s: %w", workerName, err)
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error getting tasks from worker %s: %s", workerName, resp.Status)
-	}
-
-	var tasks []*task.Task
-	err = json.NewDecoder(resp.Body).Decode(&tasks)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode tasks from worker %s: %w", workerName, err)
-	}
-
-	return tasks, nil
-}
-
-func (m *Manager) AddTask(te task.Event) {
-	m.Pending.Enqueue(te)
-}
-
-func (m *Manager) GetTasks() []*task.Task {
-	tasks := make([]*task.Task, 0, len(m.TaskStore))
-	for _, t := range m.TaskStore {
-		tasks = append(tasks, t)
-	}
-	return tasks
 }

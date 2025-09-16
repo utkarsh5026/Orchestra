@@ -42,12 +42,12 @@ type Scheduler interface {
 	Pick(scores map[string]float64, candidates []*node.Node) *node.Node
 }
 
-type SchedulerType uint
+type Type uint
 
 const (
-	RoundRobinScheduler SchedulerType = iota
+	RoundRobinScheduler Type = iota
 )
 
-func NewScheduler(st SchedulerType) Scheduler {
+func NewScheduler(st Type) Scheduler {
 	return &RoundRobin{}
 }
